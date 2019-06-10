@@ -1,0 +1,2390 @@
+Game Musings
+
+Most of the actions seem to be taking place when the on_message callback is triggered. This is the case since the game play follows client input.
+
+on_message is defined in the websocket's API. This is the method triggered, when a connected client is writting to their twin socket on my server end. 
+
+###
+The question now is where does the game logic sit?? 
+###
+One of the things I want to achieve with this design is:
+i) The logic should stand on it's own - separate from other functionality such as the websocket logic itself. It's like having the websocket logic be a road beside a building(the game). The road acts as the channel to deliver expected messages to the building residents. Perhaps we could have someone stand at the building door to recieve messages and route them to the right resident. This is a somehow silly analogy but it best describes my intention; Don't build on top of the road. 
+
+
+###
+It's not just on_message 
+###
+Actually now it's clear that on_message is not the only channel from which I can get Information useful for the game logic. There are other events the gamelogic would be interested in. These include:
+
+i)on_close
+This is called on the event that a client socket closes their connection
+
+ii)open
+This is invoked when a new WebSocket is opened
+
+
+###
+server design
+###
+
+To achieve the goal of having the game logic 'stand on it's own', It means I'll have to write the game logic outside the websocket handler class. In this model, the handler class can be set to notify the game when any events of interest occur. One way to achieve this is having a command dispatcher (cmd_dispatcher) that sits between the Web Socket Handler and the game.
+
+websocket ----> cmd_dispatcher ----> cmd_handler e.g Game
+
+
+The command dispatcher recieves a command from the handler for example on an on_message event and proceeds to call the suitable command handler (cmd_handler) to handle the command.
+
+##Game State
+There is an obvious need to manage  game state (for each game). This will be updated as the game progresses. One way to implement this is through an OOP approach where we define a Game class with all the methods and attributes needed to run a successful game. A Game class instance is a match between two players. The cmd_dispatcher will be making periodic calls to this instance's methods which in effect will update the game state.
+
+
+###Game
+I think it's important at this stage to dissect a Game class albeit the other parts have not been described/implemented. The reason is that everything else revolves around the Game class. If we can understand what the Game class needs to run a successful match, then we can define the other parts.
+
+A quick thought (unstructured) on what could be required for the Game class;
+
+i) A pair of players (socket objects) - We need socket objects that we can write to when the need arises
+
+ii) Player roles (hider or seeker) - well, to be able to process game results.
+
+iii) A 'start game' trigger. This is the answer to the not so obvious question; when does the game start??
+
+iv) A game timer that can count time and time out a player if need be. Think of a player taking too long to play their turn.
+
+v) A client notifier that pushes notifications to clients when necessary e.g game results notification
+
+vi) A game results processor that contains the logic on what constitutes a win/loss and picks a winner and a looser 
+
+vii) An 'end game' for 'nuking the game' when need be for example when a client disconnects
+
+I think this is a good place to start. We can now create a boilerplate class with some of these pieces of functionalities;
+
+
+				
+class Game:
+
+	def __init__(self, hider, seeker):
+		pass
+
+	def timer(self):
+		"""A match timer that ensures a game finishes within a defined period. Clients
+		that don't beat this period in submitting their moves get timed out"""
+		pass	
+
+	def notify(self):
+		"""A utility method that is used to push notifications to the participating clients 
+		in the game"""
+		pass	
+		
+	def start_game(self):
+		"""sets off the timer and marks the beginning of the game"""	
+		pass
+
+	def process_game_results(self):
+		"""contains the logic on what constitutes a win/loss and picks 
+		a winner and a looser""" 	
+		pass
+
+	def end_game(self):
+	"""Ends the game"""	
+		pass
+
+
+With that out of the way, I'm thinking of some data structures the game would need. I can't think of many yet, actually just one lol; A structure to hold game moves from the two clients. This is needed since we don't expect the two players to simultaneously make their move. One has to come before the other.
+A dictionary seems like a 'fancy' option. I mean a 'moves' dictionary with a player_role--result key value pairs;
+
+	moves = {hider: True, seeker:False}
+
+But I'm after simplicity. I believe variables will be enough to achieve what the dictionary is doing. So now that introduces two new instance attributes; 
+
+i) seeker_move
+ii)hider_move
+
+so now, the __init_ method becomes;
+
+
+		def __init__(self, hider, seeker):
+				"""
+				hider: a socket object for the client with a 'hider' role
+				seeker: a socket object for the client with a 'seeker' role
+				"""
+				self.hider_move = None
+				self.seeker_move = None
+
+I set the two attributes to 'None' so that I can allow for any later checks (if a client made a move already) and update them with the registered client moves.
+
+
+So far that looks good. I have a gut feeling that I shouldn't go any further with adding/implementing functionality in the Game class before understanding how the functionality that comes before the calling of the Game class works. I need to know how I'm going to get those two client sockets to instantiate a game object. The thing is I could go so deep into the Game class only to later realize for example, I can't even access the client sockets that I need to pass on to the Game class and create a class object instance lol.
+
+
+I need to understand how pairing will work. It is a pair of clients that will get passed to a Game class constructor. So pairing is the immediate implementation that comes before creating a Game instance
+
+##
+Client Pairing
+##
+
+Who get's paired and how??
+
+A client that sends a ready command (cmd_ready) is open to playing and so needs a pair. The game starts only after pairing is done so I don't expect the command dispatcher to call any Game class methods at this point. So we need a client pairing handler, that implements the functionality required to pair two clients ready to play.
+
+###client_pairer -- A function.
+This is more of a direct/specific functionality. I don't require multiple instances of it. If I had several ways of doing pairing, I could maybe start thinking of creating a class, insead of a function. For now, having just a function doing the job of pairing is enough.
+
+The pairng approach I have in mind or rather I discussed with Mark, is to simply pair the first two ready players i.e any two clients that sent the ready command and are in queue waiting to be paired. Players that come first, get the hider role (a first come gets hider basis)
+
+
+The immediate thought now is, I need a place to store 'ready players' and create some sort of a queue. From this queue I can get two clients and pair them.
+This queue ofcourse needs a time out. I cant have clients waiting forever. Another quick realization is that my queue, ideally, should not have more than 2 players. This is however only the case if I'm checking to pair atleast every other 3 seconds. When two players are in the queue , they should get paired and 'popped' out of the list.
+
+Now the structure to hold these clients should be one that is quick to access, say a set.
+
+
+	ready_clients = {ready_client_1, ready_client_2}
+
+
+On second thought, I just realized a set has a caveat; It's unordered, so It won't help me here with my first to come first to be hider model. So a list will do.
+
+	ready_clients = [ready_client_1, ready_client_2]
+
+This list will be global and can be accessed by my client_pairer() function.	
+
+so now, I have a global list and a client_pairer() function;
+
+	
+			ready_clients = []
+
+			def client_pairer(client):
+			""" Pairs clients that are ready for a match """
+				pass
+
+
+The client pairer will be manipulating the ready_clients list in two ways:
+i) adding new clients to the list.
+ii)popping a pair of clients from the list.
+
+
+Popping will only be done when there are atleast two ready clients. But then what happens when there is only one ready client? How long does the client need to wait in the lobby for a client?
+As I pointed out earlier, I'll need to have a way to timeout the wait. If a client waits for a 't' amount of time, they get timed out. Timing out a client can simply be;
+
+i)remove them from the ready_clients list after 't' seconds.
+ii)Notify them that there was not another player ready for a match to create a pair.
+
+
+Ofcourse, on the client end, the player can be given the option to 'retry' which simply repeats the pairing process; 
+
+add_to_ready_list ----> check_for_a_player_to_match ----> If other player(pair!!)--else time_out.
+
+
+I think now it's a good time to think through how exactly the actual pairing can be implemeted
+
+####pairing functionality
+
+On my way to work today, I got an Idea of two ways this can be done;
+
+i) Always checking if there are two ready players to match.
+
+I call this the 'infinite speculation loop'. This is a while loop that is always checking for any two clients in the ready list to match;
+
+				
+				ready_list = []	
+				paired_list = []
+				
+				while True:
+					if len(ready_list) > 1:
+						hider = ready_list.pop(0)
+						seeker = ready_list.pop(0)
+
+						paired_list.append((hider, seeker))
+						continue
+
+					else:
+						continue	
+
+What this simply does is check if we have atleast 2 ready players and we add them to a paired list after 'poping' them out of the redy list. Notice that we call pop on ready_list twice with an index '0'. Honestly, the need to use index '0' was not obvious to me at first but then I realized that when you 'pop' you chuck something out and the next one in line shifts to take the new empty position (index). The reason for using index zero, is to get the first client to register ready out first, then use the same index to get the other client. The loop is infinite!! (Always speculating there could be two ready players and checking)
+
+This approach requires the 'infinite speculation loop' to run in a non blocking mode; I'm thinking either of a separate thread. If it blocks for any reason, the whole server operations stalls!!! By stalling I mean, for example, the server will not be able to process any other incoming requests from other clients.
+
+If I decide to go with this method (I must admit I'm drawn to it so much, I even took a walk to enjoy the muse), I'll need to know exactly how the client can time out. I'm thinking the easier way is to have the client 'send a ready command and start a timer'. This in other words, is to mean that the client keeps a clock for how long they can wait before they opt to call a time out (client tells server 'dude, I've been waiting to be paired for 10 damn seconds, forget about pairing me!') If they wait for say 't' seconds, they request to be removed from the queue. Ofcourse, they can alway retry if they wish.
+
+The good thing about this approach is that 
+a) The server doesn't have to implement functionality for a timer.
+b) The client can have control on how long they are willing to wait to be paired, before they call time out.
+
+When a client sends a time out request, the server simply removes them from the ready_list.
+
+
+ii) On demand pairing
+
+Pairing can also be done on an on client demand basis. In this approach, the client sends a ready command and the server checks for a pair before 't' seconds elapse (in which case, the server sends a timeout).( The server holds the clock in this approach)
+
+I call it on demand because the process of looking for a pair is only started when there is a ready player. There is no while loop running in the background checking for a pair of any ready players. 
+The thought process, which tbh is already feeling complicated to piece together, is;
+
+>a client sends a ready command
+> the client is added to the list of ready players
+> the server starts a timer that checks if the client has been paired within 't' seconds (if not send a timeout to the client) 
+> If wait time has not expired, server keeps looking for a match.
+
+I think this is more complicated because I'm saying each client initiates their own process on the server (think of a thread) that checks if they can find someone to get paired with. They only give up the checking or the thread (technically speaking), only if they either find a pair or time out. In this apprach I'll end up having an implementation to spawn threads on demand by the clients which I have a bad feeling about. Compared to the 'infinite speculation loop' approach, this is a bit more complex and I'm all after simplicity so it's a no (for now!)
+
+
+
+---------------------------------
+UPDATE: THERE COULD BE ANOTHER WAY
+--------------------------------
+
+On taking another look at the infinite speculation loop, I realized it could be stripped down further or even avoided entirely. I imagine if the client is incharge of sending timeouts when they don't get paired within  't' seconds, we can implement the pairing using a more simple apporoach;
+
+> client sends a ready command
+> client is added to the list of ready clients on the server.
+> next, the server checks if the list of ready clients has atleast two players following the new addition and pairs them.
+  
+  >If not, do nothing. 
+  
+  >If a second ready client is found, it means, the ready client list will now have two clients (assuming the first one to be added didn't time out). The paring can proceed to be done.
+
+The advantage of this:
+	i) Simplicity
+	ii)No while loops hence no need of spawning any other thread!
+	iii) Simplicity
+
+
+				paired_list = []
+				ready_list = []
+				
+				if len(ready_list) > 1:
+					hider = ready_list.pop(0)
+					seeker = ready_list.pop(0)
+
+					paired_list.append((hider, seeker))
+
+
+In short, with this approach, the pairing is done on the event that a second player is added on to the list.					
+
+
+Implementation:
+
+				#a list of players that are ready for a match 
+				ready_clients_list = []
+
+				def client_pairer(client, ready_clients_list):
+					""" Pairs clients that are ready for a match """
+
+					if len(ready_clients_list) > 1:
+						hider = ready_clients_list.pop(0)
+						seeker = ready_clients_list.pop(0)
+
+						return (hider, seeker)		
+						
+					else:
+						return None	
+
+
+
+Pairing is Done!! ( atleast for now :)
+
+
+##################
+Client and Game ID's
+##################
+
+How do I associate clients with a unique Id? How do I get games to have Uniqueness too??
+
+Answering these questions is important. Imagine a client joins, gets paired and is enrolled in a game. The client will start sending game commands which we need to associate with 'this unique client' playing 'this unique game instance'. It's alot of work for me to do. alot of fun work.
+
+so I need;
+
+i) uniquely associate a client id with a client socket
+ii) uniquely associate a game id with matched up client(id's)
+
+The first one is easy. The client, during connection, will have sent their unique id to my server, which I can store on a dictionary, associating it with the client. This is the approach I agreed to have with Mark. He has a clever way of creating unique ids on the client end.
+
+
+The client details (the value side in the dictionary) will be a list of socket and name. Name is the clients name. It will come in handy when I need to tell a client the name of the other client they are matched with. A name is a normal human name e.g John
+
+	client_id_dict = {id : [socket, name]}
+
+
+The second one requires I generate unique Id's for games. The easiest approach, my way lol, is just incrementing a count (from 0) for each new game and using that as the game id. 
+
+
+	game_id_dict = {gameID : gameobject}	
+
+
+The game object will maintain the state of a game! Neat as it is.
+I can now go ahead to implement a game id generator:
+
+			
+
+					def game_id():
+						count = 0
+						while True:
+							yield count
+							count += 1
+
+The code above defines a simple python generator function that creates a generator object. The generator object will always have a new number since it defines an infinite while loop that yields an increasing count.
+
+
+
+################
+Game initializer
+################
+
+A separate Game class (to create a game) and client pairer (to pair clients) calls for a wrapper that can combine these two directly related functionalities; You can't have a game without pairing and a pairing without a game is useless. I need to come up with a way to combine the two under one umbrella. One solution is to define a game_initializer function that encompasses the two aspects.
+
+
+The game initializer will be called by the dispatcher whenever a player is ready to be matched. It will attempt to pair the player and if successful, proceed to start a game. In short a game initializer:
+
+i) creates a pair by calling the client_pairer() utility function
+ii) Starts a game by instantiating a new Game()
+
+
+					def initialize_game(client):
+						"""
+						called whenever a player is ready to be matched.
+						Attempts to pair the player and if successful, proceed to start a game. 
+						"""
+
+						#attempt to pair two clients
+						pair = client_pairer(client, ready_clients_list)
+
+						#check if pairing is successful
+						if pair:
+							#create a new game and game id 
+							new_game = Game(pair[0], pair[1])  
+							new_game_id = next(game_id())
+
+							#assign game to the game id in the game id dictionary
+							game_id_dict[new_game_id] = new_game
+
+						else:
+							return None	 
+
+
+
+
+
+####################################
+add or remove client from ready list
+####################################
+
+Given that a client can decide to time out whenever they fail to be paired within 't' seconds, that will require a way to remove them from the ready_clients_list.. Should they retry to be matched, they will be added to this list again.
+This necessiates the need for a functionality that simply adds or removes clients from this list. Clients will be added whenever they are ready to be matched. Removal of clients is done when they time out. Note that clients will also be removed (popped out) whenever they are paired BUT that is the work of the client_pairer(). What I need now is a functionality to handle adding clients to the list when thery are ready to play and remove them when they send a time out to the server.
+
+
+			def ready_client_handler(cmd, client):
+				""" adds or removes clients from the ready_clients_list.
+					clients are added whenever they send a ready (to play) command
+					and removed whenever they send a timeout.
+					
+					cmd: A game command
+					client: A client object.
+				"""
+				if cmd == "cmd_ready":
+					ready_clients_list.append(cmd)
+
+				elif cmd == "cmd_ready_timeout":
+					ready_clients_list.remove(client)
+
+				else:
+					# perhaps an error???
+					return None	 	
+
+
+##############
+Set user id
+##############
+
+We just finished discussing with Mark the command that directs setting a unique user id (uuid) for a client. This command will need a handler. I realized that I'm into creating handlers for the dispatcher already. The dispatcher will definately be defined last (after all the command handlers have been defined)
+
+The set_userid handler will expect a client object and a unique user id (uuid). A connection with an already existing uuid indicates a fresh connection - I'll simply swap the old 'websocket' connection with the new one (remember that each time a client connects, the websocket object is different). Otherwise we create a new uuid, websocket key value pair
+
+
+			def ready_client_handler(cmd, client):
+				""" adds or removes clients from the ready_clients_list.
+					clients are added whenever they send a ready (to play) command
+					and removed whenever they send a timeout.
+					
+					cmd: A game command
+					client: A client object.
+				"""
+				if cmd == "cmd_ready":
+					ready_clients_list.append(cmd)
+
+				elif cmd == "cmd_ready_timeout":
+					ready_clients_list.remove(client)
+
+				else:
+					# perhaps an error???
+					return None	 	
+
+
+
+############################
+codebase AT This Stage
+###########################
+
+#a list of players that are ready for a match 
+ready_clients_list = []
+
+# a mapping of client id with the connection socket
+client_id_dict = {}
+
+#a mapping of unique game id to respective game objects
+game_id_dict = {} 
+
+def set_userid_handler(client, uuid):
+	"""
+	sets a unique user id for a client object.
+	for existing users, replaces old 'websocket' 
+	client: a client object
+	uuid : a unique user id	
+	"""
+
+	client_id_dict[uuid] = client
+
+
+def ready_client_handler(cmd, client):
+	""" adds or removes clients from the ready_clients_list.
+		clients are added whenever they send a ready (to play) command
+		and removed whenever they send a timeout.
+		
+		cmd: A game command
+		client: A client object.
+	"""
+	if cmd == "cmd_ready":
+		ready_clients_list.append(cmd)
+
+	elif cmd == "cmd_pairingtimeout":
+		ready_clients_list.remove(client)
+
+	else:
+		# perhaps an error???
+		return None	 	
+	
+
+
+def client_pairer(client, ready_clients_list):
+	""" 
+	Pairs clients that are ready for a match. 
+	Returns a tuple of paired clients if successful else none
+
+	client: a client websocket object
+	ready_clients_list: a list of clients ready for a match
+
+	"""
+
+	if len(ready_clients_list) > 1:
+		hider = ready_clients_list.pop(0)
+		seeker = ready_clients_list.pop(0)
+
+		return (hider, seeker)		
+
+	else:
+		return None	
+
+
+def game_id():
+	"""
+	creates and returns a game Id generator. 
+	The game id generator will always have a new number.
+	"""
+	count = 0
+
+	while True:
+		yield count
+		count += 1
+
+
+class Game:
+
+	def __init__(self, hider, seeker):
+		"""
+		hider: a socket object for the client with a 'hider' role
+		seeker: a socket object for the client with a 'seeker' role
+		"""
+		self.hider = hider
+		self.seeker = seeker
+		self.hider_move = None
+		self.seeker_move = None
+
+	def timer(self):
+		"""A match timer that ensures a game finishes within a defined period. Clients
+		that don't beat this period in submitting their moves get timed out"""
+		pass	
+
+	def notify(self):
+		"""A utility method that is used to push notifications to the participating clients 
+		in the game"""
+		pass	
+		
+	def start_game(self):
+		"""sets off the timer and marks the beginning of the game"""	
+		pass
+
+	def set_move(self):
+		"""Registeres a clients move to the game"""
+		pass	
+
+	def process_game_results(self):
+		"""contains the logic on what constitutes a win/loss and picks 
+		a winner and a looser""" 	
+		pass
+
+	def end_game(self):
+		"""Ends the game"""	
+		pass
+
+
+
+def initialize_game(client):
+	"""
+	called whenever a player is ready to be matched.
+	Attempts to pair the player and if successful, proceed to start a game. 
+	"""
+
+	#attempt to pair ready clients 
+	pair = client_pairer(client, ready_clients_list)
+
+	#check if pairing is successful and launch game
+	if pair:
+		#create a new game and game id 
+		new_game = Game(pair[0], pair[1])  
+		new_game_id = next(game_id())
+
+		#assign game to the game id in the game id dictionary
+		game_id_dict[new_game_id] = new_game
+
+	else:
+		return None	 
+
+
+
+#############################################
+REVISIT: add or remove client from ready list
+#############################################
+
+On another look at the codebase and how the various parts glue together, I noticed something that was a bit off (from the rhythm of the code structure). It's the ready_client_handler(). This function utility, is now defined as follows;
+
+
+			def ready_client_handler(cmd, client):
+				""" adds or removes clients from the ready_clients_list.
+					clients are added whenever they send a ready (to play) command
+					and removed whenever they send a timeout.
+					
+					cmd: A game command
+					client: A client object.
+				"""
+				if cmd == "cmd_ready":
+					ready_clients_list.append(cmd)
+
+				elif cmd == "cmd_pairingtimeout":
+					ready_clients_list.remove(client)
+
+				else:
+					# perhaps an error???
+					return None	 	
+
+
+Two issues manifest;
+
+i) If this is an handler, it means the caller will have verified the command before making the call. So why the heck I'm I taking a 'cmd' argument??
+
+ii) The second issue is a consequence of the first; I noticed the function is doing TWO THINGS. I mean more THAN ONE.. It's adding items to a list and removing items from a list depending on the command. My fidelity for simplicity is just too high to define a function that does more than one thing haha. So time to refactor;
+
+how about I create another function that has a sole purpose of 'removing clients from the list' when they time out. This will play well with the code structure since removing clients follow a command issued by the client(cmd_pairingtimeout). The dispatcher can simply call the 'pairing_timeout_handler' handler function. 
+
+The function already has a name (read my last line again lol).. so It becomes;
+
+
+				def pairing_timeout_handler(client, ready_clients_list):
+					"""
+					removes a client from the list of clients waiting
+					to be paired i.e ready_clients_list. This follows a
+					cmd_pairingtimeout 
+
+					client: a websocket object
+					ready_clients_list: a list of clients waiting to be paired
+					"""
+
+					ready_clients_list.remove(client)
+
+
+
+That now frees my ready_client_handler to do only one job:
+
+				
+				def ready_client_handler(client_socket, ready_clients_list):
+					""" 
+					adds a client to the list of clients waiting
+					to be paired following a cmd_ready command 
+					
+					client_socket: A client's websocket object.
+					"""
+
+					ready_clients_list.append(client_socket)
+					return ready_clients_list
+
+
+
+###########################################################
+
+					GAME ON
+		
+###########################################################
+
+Now that almost everything else is handled above the Game class, I can confidently proceed to 
+think through the game play logic. Good thing I have a 'skeleton' structure of the Game class
+already in place.
+
+What better place to start coding the Game class than at the summit; start_game() method.
+
+
+##########
+Game.start_game()
+##########
+
+This method does the following (on quick thought):
+i) 'notifies' the paired clients of their pairing and game kick off.
+iii) sets off the 'game timer' that ensures the game is played within a given time period.
+
+
+I'm not sure at this point if this is all necessary. I mean, if at all I have a game_initializer sitting outside my class, why bother to do the initialization inside the game class? Perhaps it's good because I'll have all the game logic in one place. But is starting a game, i.e calling the right methods to set it off, part of the game logic?? At what point do I draw the line between game logic and the other codebase logic. There must be a line, which acts as the glue that connects the world outside the game to the game itself. I think all the game class needs is to define all the methods it needs to work then have an outside game initializer that calls the right methods of a game instance to start off the game.
+With this thought, I don't really see the need of the start_game() method. The game initializer can do exactly what the method is trying to do.
+So now the focus shifts to implement the methods the game needs to function and take care of how it sets off from outside the game class.
+
+
+
+####
+pairing_notification
+####
+
+Removing the start_game method means I need a way to implement the functionality I intended to have in the start_game method. One functionality is 'notifying paired clients of their pairing and game kick off'.
+
+This can be done with a new method of the Game class;
+
+				
+				def pairing_notifier(self):
+					"""Notifies clients of their pairing"""
+					
+					pair_data = {
+						'command' : 'cmd_pairresult',
+						'opponent' : None,
+						'role' : None,
+						'gameid' : None,
+					}
+
+					#send data to client
+					self.notify(self.hider, pair_data)
+					self.notify(self.seeker, pair_data)
+
+
+The method creates data for the pair result command and sends it to the clients (hider and seeker). Another quick look, I realize that the pair_data has some 'blank' values that need to be filled. These are the keys with value None e.g 'role'. According to the snippet above, self.notify() has to somehow fill in the data. What the heck? The work of pairing_notifier should be to give notifer just a client and data to send. Notifier knows nothing about pairing. For simplicities sake (and my sanity of course), I need to refactor what pairing_notifier() is handing self.notify(). 
+
+Solution:
+	create a pair_data template, with 'blank parts'. use this template to prepare data for hider and seeker. Hand self.notify() just the client and data to send :)
+
+	def pairing_notifier(self):
+		"""Notifies clients of their pairing"""
+
+		#a template for pair data to send 
+		pair_data_template = {
+			'command' : 'cmd_pairresult'
+			'role' : None,	
+			'opponent' : None,
+			'gameid' : ????
+		}
+
+		#pair_data for role 'hider' 
+		hider_pair_data = pair_data_template
+		hider_pair_data['role'] = 'hider'
+		hider_pair_data['opponent'] = ?????????????IDK YET
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = pair_data_template
+		seeker_pair_data['role'] = 'seeker'
+		seeker_pair_data['opponent'] = ????????????????IDK YET
+
+
+That looks good. But as you'd expect; new fixes, new f***s... I don't have the following data:
+
+i) game_id
+ii) opponent (This is the opponent's client id) 
+
+For the game id, I can simply add a game_id attribute in the Game class constructor. This will be passed in during game initialization. Remember, on game initialization, we create a game id! Fixed :)
+
+
+		pair_data_template = {
+			'command' : 'cmd_pairresult'
+			'role' : None,	
+			'opponent' : None,
+			'gameid' : self.game_id
+		}
+
+For the opponent, I'm damned. I have sockets in my class, that I can't use to access the game id associated with them. The global client id dictionary is the closest thing to being a solution but it's structure doesn't allow for getting a client id from a client websocket object;
+
+		client_id_dict = {uuid : web_socket_object}
+
+I wish we could do this (I tried lol):
+
+		client_uuid = client_id_dict[web_socket_object]		
+
+It's shady as it gets, I know. So now what.
+
+Solution-ish:
+Create a global dictionary with all the currently active socket connections as keys and any useful data such as client_uuid as values. This is more stuff and more stuff means added complexity which has me banging my head on my work desk. But wait, this global 'websocket_connections' dictionary might actually prove to be more useful than I initially thought. I could use it for doing more than just getting client uuid from websocket objects. I can for instance be able to get a list of all currently active players! So it's good! 
+
+
+		#a global dictionary of current websocket connections. contents: {websocket : uuid}
+		websocket_connections = {}
+
+
+Now I can simply remove the now damned question marks from my pairing_notifier();
+
+		def pairing_notifier(self):
+		"""Notifies clients of their pairing"""
+
+		#a template for pair data to send 
+		pair_data_template = {
+			'command' : 'cmd_pairresult'
+			'role' : None,	
+			'opponent' : None,
+			'gameid' : self.gameid
+		}
+
+		#pair_data for role 'hider' 
+		hider_pair_data = pair_data_template
+		hider_pair_data['role'] = 'hider'
+		hider_pair_data['opponent'] = websocket_connection[self.seeker]
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = pair_data_template
+		seeker_pair_data['role'] = 'seeker'
+		seeker_pair_data['opponent'] = websocket_connection[self.hider]
+
+
+Smirking** I should pat myself on the back :))
+
+
+-----------------------------
+TWO LOOKS AT THE METHOD LATER
+-----------------------------
+
+Actually I should have slapped the hell out myself earlier.
+I noticed one more thing of concern; I'm hardcodding the command key's value in my pair_data_template. This might introduce bugs in the long run e.g from typpos. It also means that if I carry on with the habit elswhere in the module and end up with  so many commands hardcoded, and say one command changes in our game protocol e.g changes to 'cmd_pair_result', It will mean that I'll have to manually search all the occurences of the command in the module and change it. A simple fix is creating a global dictionary that contains the commands, hence having one place to make any changes to commands and have it reflect everywhere.
+
+eg I can create a platform_commands global dictionary;
+
+
+platform_commands = {
+		'setuuid' : 'cmd_setuuid',
+		'pairresult' : 'cmd_pairresult',
+		'pairingtimeout': 'cmd_pairingtimeout',
+		'ready' : 'cmd_ready',
+		'submit' : 'cmd_submit',
+		'result' : 'cmd_result',
+		'pending' : 'cmd_pending',
+		'noresult' : 'cmd_noresult'
+	}
+
+
+
+This dictionary can be added as an attribute of the Game class for easy access by the class instances.
+
+On second thought. BAD IDEA. why replicate a global object?? I can simply refer to it whenever I need. One place I need it for sure, the reason for the current thought status, is in the pairing_notifier() method. I can refer to this platform_commands dictionary the part where I need to access the pairing command. 
+
+So now the pair_data_template becomes;
+
+			
+			pair_data_template = {
+			'command' : platform_commands['pairresult'], #platform_comands : global dict
+			'role' : None,	
+			'opponent' : None,
+			'gameid' : self.gameid
+		}
+
+
+
+And the method with all the updates;
+
+
+
+			def pairing_notifier(self):
+					"""Notifies clients of their pairing"""
+
+					#a template for pair data to send 
+					pair_data_template = {
+						'command' : platform_commands['pairresult'], #platform_comands : global dict
+						'role' : None,	
+						'opponent' : None,
+						'gameid' : self.gameid
+					}
+
+					#pair_data for role 'hider' 
+					hider_pair_data = pair_data_template
+					hider_pair_data['role'] = 'hider'
+					hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+					#pair_data for role 'seeker'
+					seeker_pair_data = pair_data_template
+					seeker_pair_data['role']
+					hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+
+
+Now, the last thing to wrap up on this method is to send the notifications to the clients. I'll call the self.notify() whose sole job is to send notifications!
+
+self.notify() expects to be passed a client object and data. The data needs to be json. So I'll need to json dumps my pair_data dictionaries before passing them to self.notify();
+
+
+					def pairing_notifier(self):
+						"""Notifies clients of their pairing"""
+
+						#a template for pair data to send 
+						pair_data_template = {
+							'command' : platform_commands['pairresult'], #platform_comands : global dict
+							'role' : None,	
+							'opponent' : None,
+							'gameid' : self.gameid
+						}
+
+						#pair_data for role 'hider' 
+						hider_pair_data = pair_data_template
+						hider_pair_data['role'] = 'hider'
+						hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+						#pair_data for role 'seeker'
+						seeker_pair_data = pair_data_template
+						seeker_pair_data['role']
+						hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+						#client pair data to json string
+						hider_data_json = json.dumps(hider_pair_data)
+						seeker_data_json = json.dumps(seeker_pair_data)
+
+
+						#push data to clients
+						self.notify(self.hider, hider_data_json) 
+						self.notify(self.seeker, seeker_data_json)
+
+
+That looks good. I'll leave it at that. 
+
+
+#######################################
+
+SET UNIQUE USER ID
+#######################################
+
+The first command I expect to recieve from a client websocket on connection, is the cmd_setuuid. This command requires I recieve the unique user ID submitted by the client. When I recieve it, I simply set it on the global dictionary called client_id_dict. To implement this functionality, I need;
+
+i) A dispatcher to recieve this command and pass it to a handler function (that knows what to do with it).
+ii) A handler to get the uuid from the client socket and add it to the client_id_dict.
+
+
+damn, I just realized I already implemented the handler before. It's called set_userid_handler;
+
+
+				def set_userid_handler(client, uuid):
+					"""
+					sets a unique user id for a client object.
+					for existing users, replaces old 'websocket' 
+					client: a client object
+					uuid : a unique user id	
+					"""
+
+					client_id_dict[uuid] = client
+
+
+Just one more thing I want to add to the above funtion is; to make it more functional. This basically means, the function isn't implemented for side effects (in this case, updating the client_id_dict) but is 'functional'. To do this, I added a third parameter to it; the client_id_dict, which it updates and returns it. This way, I will be able to store the client_id_dict on a different module from where the set_userid_handler() function sits and be able to import one or the other and achieve functionality. As it is now, it is REQUIRED that the client_id_dict be a global object!! 
+
+So the updated function becomes;
+
+				def set_userid_handler(client, uuid, client_id_dict):
+					"""
+					sets a unique user id for a client object.
+					for existing users, replaces old 'websocket' 
+					client: a client object
+					uuid : a unique user id	
+					"""
+
+					client_id_dict[uuid] = client
+
+					return client_id_dict
+
+
+Something else; It also becomes easier to test this function :)
+
+
+
+Now, I can start developing the dispatcher. This should be interesting
+
+##########################################
+
+COMMAND DISPATCHER
+##########################################
+
+The command dispatcher is simple. It will sit inside the on_message websocket method and will do only one thing; channel recieved commands to the right handlers.
+I'll be updating the command_dispatcher each time I'm implementing functionality for a new command.
+
+			def command_dispatcher(con_socket, cmd, data=None):
+				"""maps a recieved command to a handler function that knows how to 
+				handle the commad.
+
+				cmd- the command issued by the client
+				con_socket - the client connection's websocket object
+				data - the data sent by the client. This is optional since some commands
+					   will not be accompanied by any other data.	
+				"""
+				pass	
+
+
+The command_dispatcher is called from the websocket class. From the the websocket class, the command data(json) is loaded and the issued command by the client is read and passed on to the dispatcher together with the client connection's websocket object and the json data sent.
+
+###command_dispatcher with the set user command (cmd_setuuid)
+
+
+			def command_dispatcher(client_socket, cmd, data=None):
+				"""maps a recieved command to a handler function that knows how to 
+				handle the commad.
+
+				cmd- the command issued by the client
+				client_socket - the client connection's websocket object
+				data - the data sent by the client. This is optional since some commands
+					   will not be accompanied by any other data.	
+				"""
+					if cmd == platform_commands['setuuid']:
+						set_userid_handler(client_socket, data, client_id_dict)
+
+
+
+The command above just shows how command dispatcher can be used to call relevant command handlers.
+
+
+
+Next, I'd like to continue working on the dispatcher/handler implementation. Well, one, because its super simple and fun :) and two, I want to finish up on the dispatcher/handler commands that lead up to a game. From there, I can implement the Game class further and finish up on the dispatcher/handler functions that are used during gameplay.
+
+
+After setting the uuid, the next obvious dispatcher/handler implementation has to be for the ready command (cmd_ready).
+
+
+##############################################
+command dispatcher : ready command (cmd_ready)
+##############################################
+
+This describes how the command dispatcher handles a ready command. The initial thought is to have the dispatcher call the game initializer -- initialize_game() to do the necessary. This however introduces some bit of complexity to the game initializer - it does just too much work);
+
+i) adds the client to the list of clients ready to play (ready_clients_list)
+ii)attempts to pair a the client for a match
+iii) If pairing is successfull, a game is initialized
+
+This functionality can be seen below;
+
+				def initialize_game(client_socket, ready_clients_list):
+					"""
+					called whenever a player is ready to be matched.
+					Attempts to pair the player and if successful, proceed to start a game. 
+					"""
+
+					#add client to ready list
+					ready_clients_list = ready_client_handler(client_socket, ready_clients_list)
+
+					#attempt to pair ready clients 
+					pair = client_pairer(client_socket, ready_clients_list)
+
+					#check if pairing is successful and launch game
+					if pair:
+						#generate a game id and create a new game
+						new_game_id = next(game_id())
+						game = Game(pair[0], pair[1], new_game_id)  
+
+						#assign game to the game id in the game id dictionary
+						game_id_dict[new_game_id] = game
+
+					else:
+						return None 
+
+
+
+This, as I said, is too much work for one function. Too much for my taste, and you, if you are sane!
+
+Refactoring this is a bit tricky. I still need (i) and (ii) to be done before a game is initialized(iii). If this is going to be done from elswhere, it has to be neat, so that I don't end up with a replica of the game initializer function you see above. 
+MY wish is to have the game initializer do only one thing; Ininitalize a game!!
+
+That means, I'll have to remove two functionalities;
+
+i) adding a client to the list of clients ready to play (ready_clients_list)
+ii) pairing a the client for a match
+
+The above two functionalities will have to be done elswhere and simply pass to the game initializer a pair (either a real pair or None in the event no pair is found. The function can do the checks for itself);
+
+
+				def initialize_game(pair):
+					"""
+					pair: can be either a tuple of paired clients (websocket objects) or None. 
+
+					creates a game instance
+					"""
+
+					#check for a pair of clients and launches a game
+					if pair:
+						#generate a game id and create a new game
+						new_game_id = next(game_id())
+						game = Game(pair[0], pair[1], new_game_id)  
+
+						#assign game to the game id in the game id dictionary
+						game_id_dict[new_game_id] = game
+
+					else:
+						return None 
+
+
+
+This is neat. But it means I'll have to hook the chucked functionalities elswhere. For now, I'm thinking of having them attached to the command_dispatcher for the ready command (see the elif);
+
+
+			def command_dispatcher(client_socket, cmd, data=None):
+				"""maps a recieved command to handler function(s) that knows how to 
+				handle the commad.
+
+				client_socket - the client connection's websocket object
+				cmd- the command issued by the client
+				data - the data sent by the client. This is optional since some commands
+					   will not be accompanied by any other data.	
+				"""
+				if cmd == platform_commands['setuuid']:
+					set_userid_handler(client_socket, data, client_id_dict)
+					register_new_sock(client_socket, data, websocket_connections)
+
+				elif cmd == platform_commands['ready']:
+
+					#register submitted client name (expected to be part of the data recieved)
+					register_new_sock(client_socket, data, websocket_connections)
+					
+					#add client to ready to play list
+					ready_client_handler(client_socket, ready_clients_list)
+
+					#pair the client
+					pair = client_pairer(client_socket, ready_clients_list)				
+
+					#initialize game
+					initialize_game(pair)	
+
+
+If you are keen, you will notice that I added one more thing;
+
+on both the if and elif blocks, I added a register_new_sock().. this is a function that registeres a new socket, by adding it to the dictionary of actively connected websocket objects.
+
+the dictionary was defined earlier and is called websocket_connections and contains a mapping of websocket object to a list of unique user id and username.
+
+websocket_connections = {websocketobj: [uuid, username]}
+
+
+
+###########
+another day of work. I made a mess yesterday of this codebase. Rushing to add features I probably shouldn't have, to fix temporary problems. I have print statements allover the place. I created functions on the fly to do stuff I didn't think through. It's a mess albeit it works; 
+
+
+			import json
+			from datetime import datetime
+			import copy
+			#a dictionary of current websocket connections. contents: {websocket : [uuid, username]}
+			websocket_connections = {}
+
+			#a list of players that are ready for a match 
+			ready_clients_list = []
+
+			# a mapping of client id with the connection socket.contents: {uuid: websocket}
+			client_id_dict = {}
+
+			#a mapping of unique game id to respective game object. contents : {gameid : gameobj}
+			game_id_dict = {} 
+
+
+			#all commands defined in the platform protocol
+
+			platform_commands = {
+					'setuuid' : 'cmd_setuuid',
+					'pairresult' : 'cmd_pairresult',
+					'pairingtimeout': 'cmd_pairingtimeout',
+					'ready' : 'cmd_ready',
+					'submit' : 'cmd_submit',
+					'result' : 'cmd_result',
+					'pending' : 'cmd_pending',
+					'noresult' : 'cmd_noresult'
+				}
+
+
+			def command_dispatcher(client_socket, cmd, data=None):
+				"""maps a recieved command to handler function(s) that knows how to 
+				handle the commad.
+
+				client_socket - the client connection's websocket object
+				cmd- the command issued by the client
+				data - the data sent by the client. This is optional since some commands
+					   will not be accompanied by any other data.	
+				"""
+				if cmd == platform_commands['setuuid']:
+					set_userid_handler(client_socket, data, client_id_dict)
+					register_new_sock(client_socket, data, websocket_connections)
+					
+
+				elif cmd == platform_commands['ready']:
+
+					#register submitted client name (expected to be part of the data recieved)
+					register_username(client_socket, data, websocket_connections)
+					print("new username registered: ", websocket_connections)
+					
+					#add client to ready to play list
+					ready_client_handler(client_socket, ready_clients_list)
+					print(f"added '{websocket_connections[client_socket][1]}' to ready list: ", ready_clients_list)
+
+					#pair the client
+					pair = client_pairer(client_socket, ready_clients_list)
+					if pair:
+						pair1 = websocket_connections[pair[0]][1]
+						pair2 = websocket_connections[pair[1]][1] 
+						print(f"We have a match: {pair1} vs {pair2}")
+					else:
+						print("Couldn't find a pair.. kindly wait for a few seconds.")				
+
+					#initialize game
+					initialize_game(pair)		
+
+
+			def set_userid_handler(client_socket, data, client_id_dict):
+				"""
+				sets a unique user id for a client object.
+				for existing users, replaces old 'websocket' 
+				client_socket: a client object
+				data : a dictionary with data. Expects a uuid string.	
+				"""
+				
+				uuid = data['uuid'] #get the uuid from the data dictionary
+				client_id_dict[uuid] = client_socket #add the uuid to the client id dictionary
+
+				print("unique user id's: ", client_id_dict)
+				return client_id_dict
+
+			def register_new_sock(client_socket, data, websocket_connections):
+				""" 
+				adds a new client websocket to the list of currently connected websockets
+				client_socket: a client object
+				data : a dictionary with client data. Expects a uuid string.	
+				websocket_connections: a dictionary of current websocket connections
+				"""
+				uuid = data['uuid']
+				websocket_connections[client_socket] = [uuid] 
+
+				return websocket_connections
+
+			def register_username(client_socket, data, websocket_connections):
+				""" registeres a new username"""
+				
+				username = data.get('username', None) #if no username is submitted, set to None
+				websocket_connections[client_socket].append(username)
+				return websocket_connections	
+
+			def ready_client_handler(client_socket, ready_clients_list):
+				""" 
+				adds a client to the list of clients waiting
+				to be paired following a cmd_ready command 
+				
+				client_socket: A client's websocket object.
+				"""
+
+				ready_clients_list.append(client_socket)
+				return ready_clients_list
+
+
+			def pairing_timeout_handler(client, ready_clients_list):
+				"""
+				removes a client from the list of clients waiting
+				to be paired i.e ready_clients_list. This follows a
+				cmd_pairingtimeout 
+
+				client: a websocket object
+				ready_clients_list: a list of clients waiting to be paired
+				"""
+
+				ready_clients_list.remove(client)
+
+
+
+			def client_pairer(client, ready_clients_list):
+				""" 
+				Pairs clients that are ready for a match. 
+				Returns a tuple of paired clients if successful else none
+
+				client: a client websocket object
+				ready_clients_list: a list of clients ready for a match
+
+				"""
+				if len(ready_clients_list) > 1:
+					hider = ready_clients_list.pop(0)
+					seeker = ready_clients_list.pop(0)
+
+					return (hider, seeker)		
+
+				else:
+					return None	
+
+
+			def game_id():
+				"""
+				creates and returns a game Id generator. 
+				The game id generator will always have a new number.
+				"""
+				count = 0
+
+				while True:
+					yield count
+					count += 1
+
+
+
+
+			#####################################
+
+			# game id generator object
+			game_id_generator = game_id()
+
+
+
+			######################################
+
+
+
+
+			class Game:
+
+				def __init__(self, hider, seeker, gameid):
+					"""
+					hider: a socket object for the client with a 'hider' role
+					seeker: a socket object for the client with a 'seeker' role
+					"""
+					self.hider = hider
+					self.seeker = seeker
+					self.hider_move = None
+					self.seeker_move = None
+					self.gameid = gameid	
+
+				def notify(self, client, data):
+					"""
+					A utility method that is used to push notifications to clients 
+					in a game
+					
+					client: client object
+					data : json data to push to client
+					"""
+					client.write_message(data)
+					
+
+				def pairing_notifier(self):
+					"""Notifies clients of their pairing"""
+
+					#a template for pair data to send 
+					pair_data_template = {
+						'command' : platform_commands['pairresult'], #platform_comands : global dict
+						'role' : None,	
+						'opponent' : None,
+						'gameid' : self.gameid
+					}
+
+					#pair_data for role 'hider' 
+					hider_pair_data = copy.deepcopy(pair_data_template)
+					hider_pair_data['role'] = 'hider'
+					hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+					#pair_data for role 'seeker'
+					seeker_pair_data = copy.deepcopy(pair_data_template)
+					seeker_pair_data['role'] = 'seeker'
+					hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+					#client pair data to json string
+					hider_data_json = json.dumps(hider_pair_data)
+					seeker_data_json = json.dumps(seeker_pair_data)
+
+
+					#push data to clients
+					self.notify(self.hider, hider_data_json) 
+					self.notify(self.seeker, seeker_data_json)
+
+
+				def timer(self):
+					"""
+					A match timer that ensures a game finishes within a defined period. Clients
+					that don't beat this period in submitting their moves get timed out
+					"""
+					pass	
+
+				def set_move(self):
+					"""Registeres a clients move to the game"""
+					pass	
+
+				def process_game_results(self):
+					"""
+					contains the logic on what constitutes a win/loss and picks 
+					a winner and a looser
+					""" 	
+					pass
+
+				def end_game(self):
+					"""Ends the game"""	
+					pass
+
+
+			def initialize_game(pair):
+				"""
+				pair: can be either a tuple of paired clients (websocket objects) or None. 
+
+				creates a game instance
+				"""
+				
+				#check for a pair of clients and launches a game
+				if pair:
+					#generate a game id and create a new game
+					new_game_id = next(game_id_generator)
+					print(f"\n GAME ID: {new_game_id} \n")
+					game = Game(pair[0], pair[1], new_game_id)  
+
+					#assign game to the game id in the game id dictionary
+					game_id_dict[new_game_id] = game
+
+					#notify player of pairing
+					game.pairing_notifier()
+
+
+
+					print("Game Instances: ", game_id_dict)
+
+				else:
+					return None 
+
+
+
+
+
+
+
+								#########################
+
+										CLEAN UP
+								#########################
+
+
+####################
+a) Game Id Generator
+####################
+
+
+
+
+One dirty problem is, I had to move the id generator object insantiation down below where I define the generator function. This followed a bug I noticed; It's like in python you can't call a function 'before it's defined'. e.g;
+
+	execution = myfunction()
+
+	def myfunction():
+		return "I executed"
+
+This will not run as expected. To refactor;
+
+	def myfunction():
+		return "I executed"
+
+	execution = myfunction()
+
+	
+That will work. I honestly can't explain - even though it first appears obvious.
+Anyway this is why I had to do the instantiation down below the generator function as seen in the code. Initially the actual problem I had was that I was 'directly' calling the generator function inside the next command. This, as I'd come to realize later, was a BAD idea! The yield would always be ZERO!!!!!!!
+Don't believe me? see below;
+
+
+					def game_id():
+						"""
+						creates and returns a game Id generator. 
+						The game id generator will always have a new number. 
+						"""
+						count = 0
+
+						while True:
+							yield count
+							count += 1
+
+
+					an_id = next(game_id())		
+					another_id = next(game_id())
+
+					print(an_id)
+					print(another_id)
+
+
+If you run the snippet above, you will get 0 printed two times!! The reason may not be obvious at first(atleast it wasn't in my case). What is happening is that two times next is invoked, the game_id() function is run a fresh, setting count to 0.. so count will always be zero!!!
+
+To fix this.. next() should be called on a generator object stored somewhere in memory. This generator object is created from the genereator function, in the case above game_id()... So each time next is called, it will be called on that specific object in memory and that way it will be able to update and keep a state.
+observe;
+
+
+					def game_id():
+						"""
+						creates and returns a game Id generator. 
+						The game id generator will always have a new number. 
+						"""
+						count = 0
+
+						while True:
+							yield count
+							count += 1
+
+
+					generator_object = game_id()		
+							
+					an_id = next(generator_object)		
+					another_id = next(generator_object)
+
+					print(an_id)
+					print(another_id)
+
+Works like a charm!!!
+
+
+
+This explains how I ended up moving the functionality for generating a game id around in the codebase. The way it looks now is dirty. Too dirty. To fix this once and for all, I just thought maybe I can have the Game class deal with generating the game id. This sounds good. So each time, a Game instance is created, it gets assigned the next unique id 'automagically' lol. Took me some time to figure this out, but you can see the new class implementation below;
+
+
+			class Game:
+
+				#Class wide properties start here
+
+				def id_generator():
+					"""
+					a simple game id generator. The id is generated in an incremental
+					fashion.e.g 0, 1, 2, 3, 4 etc
+					"""
+					count = 0
+					while True:
+						yield count
+						count += 1
+
+				#create a game id generator object
+				id_generator_object = id_generator()
+
+				#Class Insance properties start here
+				def __init__(self, hider, seeker):
+					"""
+					hider: a socket object for the client with a 'hider' role
+					seeker: a socket object for the client with a 'seeker' role
+					"""
+					self.hider = hider
+					self.seeker = seeker
+					self.hider_move = None
+					self.seeker_move = None
+					self.gameid = next(id_generator_object)	#using the class'es id_generator_object
+
+
+
+
+The new changes simply mean that on instantiating a new game object, the object/instance will get assigned the next game id, using the id_generator_object. What I can add maybe to clear things up coz this is starting to look mirky, is that; notice the id_generator_object variable will be created once, and stored somewhere in memory. Each time a new instance is created, it referes to this id_generator_object state in memory and assigns itself an id (as seen in the constructor!)
+
+
+The new changes have a ripple effect on the game initializer;
+
+		def initialize_game(pair):
+			"""
+			pair: can be either a tuple of paired clients (websocket objects) or None. 
+
+			creates a game instance
+			"""
+			
+			#check for a pair of clients and launches a game
+			if pair:
+
+				game_instance = Game(pair[0], pair[1])  
+
+				#map Game instance (object) to it's game id (integer) - in the game id dictionary 
+				game_id_dict[game_instance.gameid] = game_instance
+
+				#notify clients of their pairing
+				game_instance.pairing_notifier()
+
+
+
+				print("Game Instances: ", game_id_dict)
+
+			else:
+				return None 
+
+
+
+What you should note is that when instantiating new Game objects, I'm not passing a game id argument.That is already being done inside the class. Beautiful huh!
+The changes also mean that I nolonger need to keep the initial game_id() function. I deleted it. The class is doing everything for us now as far as game id assignment is concerned.
+
+I also made a subtle change inside the initialize_game() function. I changed the name for a Game object from 'game' to 'game_instance'. This reads more clearly, I mean it's more intuitive.
+
+
+
+###############################
+b) pairing notifier - deep copy
+###############################
+
+Initially, the pairing notifier method (of the Game class), was implemented as seen below;
+
+	def pairing_notifier(self):
+		"""Notifies clients of their pairing"""
+
+		#a template for pair data to send 
+		pair_data_template = {
+			'command' : platform_commands['pairresult'], #platform_comands : global dict
+			'role' : None,	
+			'opponent' : None,
+			'gameid' : self.gameid
+		}
+
+		#pair_data for role 'hider' 
+		hider_pair_data = pair_data_template
+		hider_pair_data['role'] = 'hider'
+		hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = pair_data_template
+		seeker_pair_data['role'] = 'seeker'
+		hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+		#clients pair data to json string
+		hider_data_json = json.dumps(hider_pair_data)
+		seeker_data_json = json.dumps(seeker_pair_data)
+
+
+		#push data to clients
+		self.notify(self.hider, hider_data_json) 
+		self.notify(self.seeker, seeker_data_json)
+
+
+
+The part I'm interested in or rather I had another problem with before the new update was, how I'm copying the pair_data_template dictionary. The idea of using a template, as discussed before was so that the template data could be shaped to suit other parts that implement it for instance, a client with a role of seeker, will not be sent the same pairing information as a client with a role of hider. However, these two clients share alot in common as far as pairing information is concerned. So the solution is to have a parent template that they can each borrow to model their own. This can be seen in the following code;
+
+
+		#pair_data for role 'hider' 
+		hider_pair_data = pair_data_template
+		hider_pair_data['role'] = 'hider'
+		hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = pair_data_template
+		seeker_pair_data['role'] = 'seeker'
+		hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+The problem is in how I'm copying the pair_data_template!... The idea is to copy the 'structure' but what I'm copying is just the dictionaries reference keys. This means that any changes made to one of the variablies copying the dictionary, will be affecting every other copy including the parent template. In my case above, changing the seeker_pair_data variable, affects both the hider_pair_data and pair_data_template.
+
+Solution;
+
+What I want is to copy distinct structures i.e not to just copy a 'reference key'. This necessiates the need to do a 'deep copy'. The solution is found in the standard librarie's 'copy' command. Specifically the copy.deepcopy functionality.
+
+The code updates include;
+
+		#pair_data for role 'hider' 
+		hider_pair_data = copy.deepcopy(pair_data_template)
+		hider_pair_data['role'] = 'hider'
+		hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = copy.deepcopy(pair_data_template)
+		seeker_pair_data['role'] = 'seeker'
+		hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+
+The new updated pairing_notifier() method becomes;
+
+
+	def pairing_notifier(self):
+		"""Notifies clients of their pairing"""
+
+		#a template for pair data to send 
+		pair_data_template = {
+			'command' : platform_commands['pairresult'], #platform_comands : global dict
+			'role' : None,	
+			'opponent' : None,
+			'gameid' : self.gameid
+		}
+
+		#pair_data for role 'hider' 
+		hider_pair_data = copy.deepcopy(pair_data_template)
+		hider_pair_data['role'] = 'hider'
+		hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = copy.deepcopy(pair_data_template)
+		seeker_pair_data['role'] = 'seeker'
+		hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+		#clients pair data to json string
+		hider_data_json = json.dumps(hider_pair_data)
+		seeker_data_json = json.dumps(seeker_pair_data)
+
+
+		#push data to clients
+		self.notify(self.hider, hider_data_json) 
+		self.notify(self.seeker, seeker_data_json)
+
+
+
+##############################
+c) print functions everywhere!
+##############################
+
+Starting from the top, I see I imported the datetime module. Why the heck!
+Just to mark the time a socket connects, and debug my 'not working as expected at the time' code?
+
+This is the same problem I spot on my code with all those print functions! The two are similar in this way; Both worlds can meet in the logging module. So I need to have logs instead of all this!!
+
+I'll use the python's standard library logging framework. It has enough features to achieve the logging functionality the app needs. It's my first time using it, so there are gonna be bumps and pitfalls, which I don't mind at all - 'messes are the artists true friend'.
+
+There are several ways to configure a logger. For neatness and decoupling's sake, I prefer using a Json configuration file which I load to my modules as a dict (json.load) using the loggers dictConfig() utility;
+
+
+
+					import logging
+					import logging.config
+
+					#set up logging 
+
+					#load logging configuration 
+					with open("logs/logging_configuration.json", 'r') as f:
+						log_config_dict = json.load(f) 
+
+					logging.config.dictConfig(log_config_dict)
+					logger = logging.getLogger(__name__) #custom logger
+
+
+
+The logging_configuration.json is a json file containing the configuration for my logger. It's contents include;
+
+
+				{
+					"version" : 1,
+					"disable_existing_loggers" : false,
+					"formatters" : {
+						"simple" : {
+							"format" : "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+						}
+					},
+					"handlers" : {
+						"console_handler" : {
+							"class" : "logging.StreamHandler",
+							"level" : "DEBUG",
+							"formatter" : "simple",
+							"stream" : "ext://sys.stdout"
+						},
+
+						"file_handler" : {
+							"class" : "logging.handlers.RotatingFileHandler",
+							"level" : "INFO",
+							"formatter" : "simple",
+							"filename" : "logs/app.log",
+							"maxBytes" : 10485760,
+							"backupCount" : 10,
+							"encoding" : "utf8"
+						}
+					},
+
+					"root" : {
+						"level" : "DEBUG",
+						"handlers" : ["console_handler", "file_handler"] 
+					}
+				}
+
+
+The configuration includes, the deafault root logger, two handlers (console_handler and file_handler) and one formatter (simple).. You'll notice that my file_handler is actually a rotating file handler (to avoid cases where log files become too large).
+
+
+
+I removed all the print functions from my game module. It's miles better now;
+
+##########################################################################################				
+
+import json
+import copy
+import logging
+import logging.config
+
+#set up logging 
+
+#load logging configuration 
+with open("logs/logging_configuration.json", 'r') as f:
+	log_config_dict = json.load(f) 
+
+logging.config.dictConfig(log_config_dict)
+logger = logging.getLogger(__name__) #custom logger
+
+
+
+#......app code starts here....... 
+
+#a dictionary of current websocket connections. contents: {websocket : [uuid, username]}
+websocket_connections = {}
+
+#a list of players that are ready for a match 
+ready_clients_list = []
+
+# a mapping of client id with the connection socket.contents: {uuid: websocket}
+client_id_dict = {}
+
+#a mapping of unique game ids to respective game objects. contents : {gameid : gameobj}
+game_id_dict = {} 
+
+
+#all commands defined in the platform protocol
+
+platform_commands = {
+		'setuuid' : 'cmd_setuuid',
+		'pairresult' : 'cmd_pairresult',
+		'pairingtimeout': 'cmd_pairingtimeout',
+		'ready' : 'cmd_ready',
+		'submit' : 'cmd_submit',
+		'result' : 'cmd_result',
+		'pending' : 'cmd_pending',
+		'noresult' : 'cmd_noresult'
+	}
+
+
+def command_dispatcher(client_socket, cmd, data=None):
+	"""maps a recieved command to handler function(s) that knows how to 
+	handle the commad.
+
+	client_socket - the client connection's websocket object
+	cmd- the command issued by the client
+	data - the data sent by the client. This is optional since some commands
+		   will not be accompanied by any other data.	
+	"""
+	if cmd == platform_commands['setuuid']:
+		set_userid_handler(client_socket, data, client_id_dict)
+		register_new_sock(client_socket, data, websocket_connections)
+		
+
+	elif cmd == platform_commands['ready']:
+
+		#register submitted client name (expected to be part of the data recieved)
+		register_username(client_socket, data, websocket_connections)
+		
+		#add client to ready to play list
+		ready_client_handler(client_socket, ready_clients_list)
+		logger.info(f"added '{websocket_connections[client_socket][1]}' with sock: {client_socket} to ready list")
+
+		#pair the client
+		logger.info(f"Finding a pair for {client_socket}")
+		pair = client_pairer(client_socket, ready_clients_list)
+
+		if pair:
+			pair1 = websocket_connections[pair[0]][1]
+			pair2 = websocket_connections[pair[1]][1] 
+			logger.info(f"Successfully Paired: [{pair1} vs {pair2}]")
+		else:
+			logger.info(f"Couldn't find a pair for {client_socket}. Waiting for other players.")				
+
+		#initialize game
+		initialize_game(pair)		
+
+
+def set_userid_handler(client_socket, data, client_id_dict):
+	"""
+	sets a unique user id for a client object.
+	for existing users, replaces old 'websocket' 
+	client_socket: a client object
+	data : a dictionary with data. Expects a uuid string.	
+	"""
+	try:
+		uuid = data['uuid'] #get the uuid from the data dictionary
+		client_id_dict[uuid] = client_socket #add the uuid to the client id dictionary
+		logger.info(f"successfully set the uuid for {client_socket}")
+
+	except Exception as e:
+		logger.exception(f"There was an error setting the uuid for {client_socket}")	
+
+	return client_id_dict
+
+def register_new_sock(client_socket, data, websocket_connections):
+	""" 
+	adds a new client websocket to the list of currently connected websockets
+	client_socket: a client object
+	data : a dictionary with client data. Expects a uuid string.	
+	websocket_connections: a dictionary of current websocket connections
+	"""
+	try:
+		uuid = data['uuid']
+		websocket_connections[client_socket] = [uuid] 
+		logger.info(f"Successfully registered socket: {client_socket}")
+
+	except Exception as e:
+		logger.exception(f"There was an error registering socket: {client_socket}")	
+
+	return websocket_connections
+
+def register_username(client_socket, data, websocket_connections):
+	""" registeres a new username"""
+	try:
+		username = data.get('username', None) #if no username is submitted, set to None
+		websocket_connections[client_socket].append(username)
+		logger.info(f"Successfully registered username [{username}] for socket: {client_socket}")
+
+	except Exception as e:
+		logger.exception(f"There was an error registering username socket username for: {client_socket}")	
+
+	return websocket_connections	
+
+def ready_client_handler(client_socket, ready_clients_list):
+	""" 
+	adds a client to the list of clients waiting
+	to be paired following a cmd_ready command 
+	
+	client_socket: A client's websocket object.
+	"""
+
+	ready_clients_list.append(client_socket)
+	return ready_clients_list
+
+
+def pairing_timeout_handler(client, ready_clients_list):
+	"""
+	removes a client from the list of clients waiting
+	to be paired i.e ready_clients_list. This follows a
+	cmd_pairingtimeout 
+
+	client: a websocket object
+	ready_clients_list: a list of clients waiting to be paired
+	"""
+
+	ready_clients_list.remove(client)
+
+
+
+def client_pairer(client, ready_clients_list):
+	""" 
+	Pairs clients that are ready for a match. 
+	Returns a tuple of paired clients if successful else none
+
+	client: a client websocket object
+	ready_clients_list: a list of clients ready for a match
+
+	"""
+	if len(ready_clients_list) > 1:
+		hider = ready_clients_list.pop(0)
+		seeker = ready_clients_list.pop(0)
+
+		return (hider, seeker)		
+
+	else:
+		return None	
+
+
+class Game:
+
+	#Class wide properties start here
+
+	def id_generator():
+		"""
+		a simple game id generator. The id is generated in an incremental
+		fashion.e.g 0, 1, 2, 3, 4 etc
+		"""
+		count = 0
+		while True:
+			yield count
+			count += 1
+
+	#create a game id generator object
+	id_generator_object = id_generator()
+
+	#Class Insance properties start here
+	def __init__(self, hider, seeker):
+		"""
+		hider: a socket object for the client with a 'hider' role
+		seeker: a socket object for the client with a 'seeker' role
+		"""
+		self.hider = hider
+		self.seeker = seeker
+		self.hider_move = None
+		self.seeker_move = None
+		self.gameid = next(Game.id_generator_object) #using the class'es id_generator_object
+
+	def notify(self, client, data):
+		"""
+		A utility method that is used to push notifications to clients 
+		in a game
+		
+		client: a websocket object
+		data : json data to push to client
+		"""
+		client.write_message(data)
+		
+
+	def pairing_notifier(self):
+		"""Notifies clients of their pairing"""
+
+		#a template for pair data to send 
+		pair_data_template = {
+			'command' : platform_commands['pairresult'], #platform_comands : global dict
+			'role' : None,	
+			'opponent' : None,
+			'gameid' : self.gameid
+		}
+
+		#pair_data for role 'hider' 
+		hider_pair_data = copy.deepcopy(pair_data_template)
+		hider_pair_data['role'] = 'hider'
+		hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = copy.deepcopy(pair_data_template)
+		seeker_pair_data['role'] = 'seeker'
+		hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+		#clients pair data to json string
+		hider_data_json = json.dumps(hider_pair_data)
+		seeker_data_json = json.dumps(seeker_pair_data)
+
+
+		#push data to clients
+		self.notify(self.hider, hider_data_json) 
+		self.notify(self.seeker, seeker_data_json)
+
+
+	def timer(self):
+		"""
+		A match timer that ensures a game finishes within a defined period. Clients
+		that don't beat this period in submitting their moves get timed out
+		"""
+		pass	
+
+	def set_move(self):
+		"""Registeres a clients move to the game"""
+		pass	
+
+	def process_game_results(self):
+		"""
+		contains the logic on what constitutes a win/loss and picks 
+		a winner and a looser
+		""" 	
+		pass
+
+	def end_game(self):
+		"""Ends the game"""	
+		pass
+
+
+def initialize_game(pair):
+	"""
+	pair: can be either a tuple of paired clients (websocket objects) or None. 
+
+	creates a game instance
+	"""
+	
+	#check for a pair of clients and launch a game
+	if pair:
+		game_instance = Game(pair[0], pair[1])  
+
+		# update the game id dictionary 
+		game_id_dict[game_instance.gameid] = game_instance
+
+		#notify clients of their pairing
+		game_instance.pairing_notifier()
+
+		#log information
+		logger.debug(f"added new game instance: {game_id_dict}")
+
+	else:
+		return None 
+
+
+
+#################################################################################################
+
+
+################################
+BUG: client paired to themselves 
+################################
+
+My colleague Mark, spotted a bug in my code. The pairing system has a flaw; a client can be paired to themselves.
+
+The root of the problem has to be the ready_client_handler which is the handler that adds clients to a list of clients seeking to be paired.
+
+		def ready_client_handler(client_socket, ready_clients_list):
+			""" 
+			adds a client to the list of clients waiting
+			to be paired following a cmd_ready command 
+			
+			client_socket: A client's websocket object.
+			"""
+
+			ready_clients_list.append(client_socket)
+			return ready_clients_list
+
+
+
+A quick fix would be adding a check for whether a client already exists in the ready_clients_list first, to avoid having adding them more than once. Since we are dealing with a list, I'm a bit uneasy with this fix. Lists are 'known to be slow' when used with the 'in' keyword for checking whether an element is a memeber. Sets are known to be much faster. Actually a set would solve the problem 10 X better since in a set, you cannot have duplicates in the first place (so no need of checking even!!).. But then a set is not ordered, so it won't work well for my pairing mechanism whereby I assign roles based on who came first!
+
+On second thought, I realized that my list of ready players will hardly contain more than two clients (if never). As soon as two clients are present in the list, they get popped out. So the time taken for 'in' checks will hardly be of much significance. So, I'll keep the list, and do a simple membership check using  the 'in' keyword.
+
+
+			def ready_client_handler(client_socket, ready_clients_list):
+				""" 
+				adds a client to the list of clients waiting
+				to be paired following a cmd_ready command 
+				
+				client_socket: A client's websocket object.
+				"""
+
+				#membership check to avoid having more than one instance.
+				#more than one instance means a client could get paired to themselves.
+				if client_socket not in ready_clients_list:
+					ready_clients_list.append(client_socket)
+				else:
+					logger.warning(f"{client_socket} already in the ready_clients_list: {ready_clients_list}!")	
+				
+				return ready_clients_list
+
+
+This should work well.
+
+
+
+
+							##############################
+									GAME CLASS FINALE 
+							##############################
+
+
+Time to finish up implementing the Game class functionalities. Before I get to adding new features, I want to do a few minor updates on existing implementations.
+
+
+###########################
+UPDATE: pairing_notifier
+###########################
+
+Current implementation;
+
+def pairing_notifier(self):
+		"""Notifies clients of their pairing"""
+
+		#a template for pair data to send 
+		pair_data_template = {
+			'command' : platform_commands['pairresult'], #platform_comands : global dict
+			'role' : None,	
+			'opponent' : None,
+			'gameid' : self.gameid
+		}
+
+		#pair_data for role 'hider' 
+		hider_pair_data = copy.deepcopy(pair_data_template)
+		hider_pair_data['role'] = 'hider'
+		hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = copy.deepcopy(pair_data_template)
+		seeker_pair_data['role'] = 'seeker'
+		hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+		#clients pair data to json string
+		hider_data_json = json.dumps(hider_pair_data)
+		seeker_data_json = json.dumps(seeker_pair_data)
+
+
+		#push data to clients
+		self.notify(self.hider, hider_data_json) 
+		self.notify(self.seeker, seeker_data_json)
+
+
+First thing first;
+There is a serious bug on the pair data section of the code above. Specifically, observe the part where I set the pair_data for seeker;
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = copy.deepcopy(pair_data_template)
+		seeker_pair_data['role'] = 'seeker'
+		hider_pair_data['opponent'] = websocket_connections[self.hider]
+
+The last bit, setting the 'opponent' key, I'm referring to the wrong dictionary!! I'm setting the 'opponent' key for the hider_pair_data dictionary when I should be using the seeker_pair_data dictionary. 
+Fix;
+
+		#pair_data for role 'seeker'
+		seeker_pair_data = copy.deepcopy(pair_data_template)
+		seeker_pair_data['role'] = 'seeker'
+		seeker_pair_data['opponent'] = websocket_connections[self.hider]
+
+
+Another thing;
+Still on the same part (where I'm creating pair data for both the 'hider' and 'seeker'), you'll notice that for the 'opponent' key, the value set is going to be a list of uuid and username.
+
+i.e
+
+	hider_pair_data['opponent'] = websocket_connections[self.seeker]
+
+						... 
+
+	seeker_pair_data['opponent'] = websocket_connections[self.seeker]
+
+
+Remember; The websocket_connections dictionary is a global object with the following content structure;
+
+websocket_connections = {
+	websocketobject : [uuid, username]
+}
+
+
+The value I'm after is not the list but just the username;
+
+	hider_pair_data['opponent'] = websocket_connections[self.seeker][1]
+
+						... 
+
+	seeker_pair_data['opponent'] = websocket_connections[self.seeker][1]
+
+
+
+That should work well now.
+
+
+
+#################################
+Set Player Move - Game.set_move()
+#################################
+
+Logically, this looks like the right, next implementation addition to the Game class!
+
+Here, I'm expecting to recieve moves from clients and updating their respective variables storing their moves.
+
+On quick thought, this is what is happening in the set_move() method;
+
+i) recieve a client move
+ii) update the clients move variable
+
+I picture that the way this is going to fit in the rest of the project, is, this method will be called from the dispatcher when a client submits a move. The method will then handle making the moves.
+
+Now, to implement the two functionalities listed above;
+
+(i) Recieve a client move
+
+This indicates that the Game.set_move(self) needs to accept one more argument; the client move.
+
+		Game.set_move(self, client_move)
+
+But then what good is a move without knowing who is making it? So we need to know the client's role in the game. That calls for an additional parameter;
+
+		
+		Game.set_move(self, client_move, client_role)
+
+
+
+Those parameters look enough(for now), to implement the required method's functionality. These parameters will be passed during the call to the method, most likely from the command dispatcher!
+
+
+(ii) Update the clients move variable
+
+This is the method's body implementation;
+
+
+	def set_move(self, client_move, client_role):
+		"""Registeres a clients move to the game"""
+		
+		try:
+			if type(client_move) == bool:
+				if client_role = self.hider: 
+					self.hider_move = client_move #set hider move
+				
+				elif client_role == self.seeker:
+					self.seeker_move == client_move #set seeker move
+
+				else:
+					raise(ValueError(f"Unidentified client role type. Expected 'hider' or 'seeker' but got '{client_role}'."))
+			else:
+				raise ValueError(f"A client move must be a bool. Type {type(client_move)} was given")		
+
+		except Exception as e:
+			logger.exception("An error was encountered when setting a client move:")		
+
+
+
+
+I'm simply catching any errors to do with submission of unexpected types for the methods parameters. If there are no errors, the method simply updates the client move for the given client role.
+
+
+The next thing is to set up how this method will be called. This will be done from the command dispatcher. The vision is; 
+>a client sends a move submission command (cmd_submit).
+>The command dispatcher parses the command's payload and extracts:
+	i)gameid --> To be used to locate the game instance to update
+	ii)role --> The game role of the client. It's a required parameter for the command handler (this will be the Game.set_move() method.)
+	iii)move --> This is the client's move. It's a required parameter for the command handler.
+
+> The command dispatcher calls the cmd_submit handler which is the Game.set_move() method.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+>> initialize game called on dispatcher
+>> add client to sockets list
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+>>>>Random Notes<<<<<<
+1. Tornado (current version:6.0.2) implements websockets as defined in RFC 6455 standard. This might not be the same implementation used by clients out in the wild e.g Certain browser versions (notably Safari 5.x) implemented an earlier draft of the protocol (known as “draft 76”) and are not compatible with this Tornado module. So check Mark's client version for compatibility with my server version.
+
+
+
+>>>>> Clean up command dispatcher... remove the if, else clauses in the ready command body.
+
+
+
+
+
+
+

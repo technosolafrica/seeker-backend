@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>a simple test client for the seekers project</title>
+</head>
+<body>
+
+	<div id="messages">
+		<p> messages recieved: </p>
+
+	</div>
+
+	<script type="text/javascript">
+
+
+		//define variables
+		var wsocket = new WebSocket("ws://172.16.40.86:5000");
+		var username = prompt("What's your name?"); 
+		var gameid;
+		var gamerole;
+
+
+		//send a message
+		function sendMessage(cmd){
+
+			//data to send
+			var payload_id = {
+				"command" : "cmd_setuuid",
+				"uuid" : "un1Qu3u11d"	
+			}
+
+			var payload_ready = {
+				"command" : "cmd_ready",
+				"username" : username	
+			}
+
+			var payload_move = {
+				"command" : "cmd_submit",
+				"gameid" : window.gameid,
+				"role" : window.gamerole,
+				"move" : (window.playerMove == 'true')
+			}
+
+			if(cmd == 'send_id'){
+				wsocket.send(JSON.stringify(payload_id));	
+			}
+			else if(cmd == 'ready'){
+				wsocket.send(JSON.stringify(payload_ready))	
+			}
+			else if(cmd == 'move'){
+				wsocket.send(JSON.stringify(payload_move))		
+			}
+			
+			return false;
+		} 
+
+
+		function movePrompt(){
+			//send a move 
+			window.playerMove = (prompt("What's your move?")).toLowerCase();
+			sendMessage('move') 
+		}
+
+		// recieve a message
+		wsocket.onmessage = function(evt) {
+
+			//create a div with the format 'user: message'
+			var messageBox = document.createElement("div"); 
+
+			//parse the json data recieved 
+			var messageDict = JSON.parse(evt.data)
+		
+			if(messageDict.command == 'cmd_pairresult'){
+				messageBox.innerHTML = "<br>command :" + messageDict.command + "<br>role :" + messageDict.role + "<br>Game ID : " + messageDict.gameid + "<br>opponent : " + messageDict.opponent + "<br><br><div><button id='mvBtn' onclick='movePrompt()'>MAKE MOVE</button></div>";
+
+				//set variables (global)
+				window.gamerole = messageDict.role
+				window.gameid = messageDict.gameid				
+
+			}
+			else if(messageDict.command == 'cmd_result'){
+				if(messageDict.outcome == true){
+					messageBox.innerHTML = "<br><br><h1>YOU WON!</h1>"
+				}
+				else{
+					messageBox.innerHTML = "<br><br><h1>YOU LOST!</h1>"	
+				}
+			}
+			else if(messageDict.command = 'cmd_ack'){
+				messageBox.innerHTML = "<br>" + messageDict.ack
+				sendMessage('send_id')
+				sendMessage('ready')
+			}
+			
+
+			document.getElementById("messages").appendChild(messageBox) 
+
+		}
+
+	</script>
+
+
+</body>
+</html>
